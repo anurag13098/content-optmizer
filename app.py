@@ -145,10 +145,10 @@ ORIGINAL ARTICLE:
 {article}
 
 REQUIREMENTS:
-1. Produce a complete, polished, original rewritten article, not an outline or a list of suggestions.
+1. Produce a complete, polished, original rewritten article, not an outline or list of suggestions.
 2. Preserve the original article's factual meaning, named entities, prices, discount codes, dates, links, and claims. Do not invent facts, offers, statistics, testimonials, or product details.
 3. Add relevant missing phrases naturally where they genuinely fit. Do not force irrelevant phrases or keyword-stuff.
-4. Put **Markdown bold** around each newly added target phrase or meaningful new wording. Do not bold text that was already present in the original unless needed for a heading.
+4. Put **Markdown bold** around each newly added target phrase or meaningful new wording. Do not bold text already present unless needed for a heading.
 5. Preserve useful headings and improve the structure where appropriate. Use clear H2/H3 headings.
 6. Do not mention competitor websites or say that you used AI.
 7. Return only the finished article in Markdown. No preface, analysis, checklist, or explanation.
@@ -164,11 +164,11 @@ REQUIREMENTS:
     return result
 
 
-def run_analysis():
-    if not keyword.strip():
+def perform_research(query, article, count, minimum, limit):
+    if not query.strip():
         st.warning("Enter a target search query.")
         return
-    if len(content.split()) < 50:
+    if len(article.split()) < 50:
         st.warning("Please paste at least 50 words of article content.")
         return
     if not SERPAPI_KEY:
@@ -177,7 +177,7 @@ def run_analysis():
 
     try:
         with st.spinner("Retrieving Google results..."):
-            results = search_google(keyword.strip(), result_limit)
+            results = search_google(query.strip(), count)
     except Exception as exc:
         st.error(f"Search request failed: {exc}")
         return
@@ -185,10 +185,8 @@ def run_analysis():
         st.warning("No organic results were returned.")
         return
 
-    st.success(f"Retrieved {len(results)} organic results.")
-    st.subheader("Search results and extracted page text")
-    jobs = {}
     pages = []
+    jobs = {}
     progress = st.progress(0)
     with ThreadPoolExecutor(max_workers=4) as pool:
         for pos, item in enumerate(results, 1):
@@ -203,17 +201,57 @@ def run_analysis():
             except Exception:
                 page_text, error = None, "Unexpected extraction error."
             pages.append({
-                "position": pos, "title": item.get("title", "Untitled"),
-                "url": item.get("link", ""), "snippet": item.get("snippet", ""),
-                "text": page_text, "error": error,
+                "position": pos,
+                "title": item.get("title", "Untitled"),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+                "text": page_text,
+                "error": error,
             })
             finished += 1
             progress.progress(finished / max(len(jobs), 1))
     progress.empty()
     pages.sort(key=lambda p: p["position"])
-    good = [p for p in pages if p["text"]]
-    st.metric("Pages with extracted text", f"{len(good)} / {len(results)}")
+    good_pages = [p for p in pages if p["text"]]
+    if not good_pages:
+        st.error("No page text was extracted. Try another query or retry later.")
+        return
 
+    report, report_error = make_gap_report(
+        [p["text"] for p in good_pages], article, minimum, limit
+    )
+    missing_terms = []
+    if not report.empty:
+        missing_terms = report.loc[
+            report["Your article"] == "Not found", "Topic / phrase"
+        ].tolist()
+
+    st.session_state["research_data"] = {
+        "pages": pages,
+        "report": report.to_dict(orient="records"),
+        "report_error": report_error,
+        "missing_terms": missing_terms,
+        "query": query.strip(),
+        "article": article,
+    }
+    # A new research run should clear any previous generated draft.
+    st.session_state.pop("optimized_article", None)
+
+
+if "research_data" not in st.session_state:
+    st.session_state["research_data"] = None
+
+if st.button("Analyze my content", type="primary", use_container_width=True):
+    perform_research(keyword, content, result_limit, min_coverage, max_terms)
+
+# Render saved research on every rerun. This keeps the rewrite button available
+# after Streamlit reruns the script when the user clicks it.
+data = st.session_state.get("research_data")
+if data:
+    pages = data["pages"]
+    good_pages = [p for p in pages if p["text"]]
+    st.success(f"Retrieved {len(pages)} organic results; extracted readable text from {len(good_pages)} pages.")
+    st.subheader("Search results and extracted page text")
     for page in pages:
         with st.expander(f"{page['position']}. {page['title']}"):
             st.write(page["url"])
@@ -221,72 +259,65 @@ def run_analysis():
                 st.caption(page["snippet"])
             if page["text"]:
                 st.success(f"Content extracted: {len(page['text'].split()):,} words")
-                st.text_area("Extracted text preview", page["text"][:4000],
-                             height=150, key=f"page_{page['position']}", disabled=True)
+                st.text_area(
+                    "Extracted text preview", page["text"][:4000], height=150,
+                    key=f"page_preview_{page['position']}", disabled=True
+                )
             else:
                 st.warning(page["error"] or "Could not extract text.")
 
-    if not good:
-        st.error("No page text was extracted. Try another query or retry later.")
-        return
-
     st.subheader("Content gap report")
-    report, error = make_gap_report([p["text"] for p in good], content, min_coverage, max_terms)
-    if error:
-        st.warning(error)
-        missing_terms = []
-    else:
-        gaps = report[report["Your article"] == "Not found"]
+    if data["report"]:
+        report_df = pd.DataFrame(data["report"])
         a, b, c = st.columns(3)
-        a.metric("Pages analyzed", len(good))
-        b.metric("Topics displayed", len(report))
-        c.metric("Potential gaps", len(gaps))
+        a.metric("Pages analyzed", len(good_pages))
+        b.metric("Topics displayed", len(report_df))
+        c.metric("Potential gaps", len(data["missing_terms"]))
         st.caption("These phrases are research prompts, not mandatory keywords.")
-        st.dataframe(report, use_container_width=True, hide_index=True)
-        missing_terms = gaps["Topic / phrase"].tolist()
-        if missing_terms:
-            st.write("Topics to review:", ", ".join(missing_terms[:15]))
+        st.dataframe(report_df, use_container_width=True, hide_index=True)
         st.download_button(
-            "Download report as CSV", report.to_csv(index=False).encode("utf-8"),
+            "Download report as CSV", report_df.to_csv(index=False).encode("utf-8"),
             "content_gap_report.csv", "text/csv"
         )
+        if data["missing_terms"]:
+            st.write("Topics to review:", ", ".join(data["missing_terms"][:15]))
+    else:
+        st.warning(data["report_error"] or "No keyword gaps were identified.")
 
     st.divider()
     st.subheader("✨ Generate your optimized article")
-    st.write("Gemini will rewrite the complete article and bold newly incorporated relevant phrases.")
+    st.write("Your research is saved. Click below to ask Gemini to rewrite the complete article and bold newly added relevant phrases.")
+
     if not GEMINI_API_KEY:
-        st.warning("Gemini key missing. Add GEMINI_API_KEY to Streamlit Secrets to enable rewriting.")
-        return
+        st.error("Gemini API key missing. Add GEMINI_API_KEY to Streamlit Secrets.")
+    else:
+        if st.button("Generate optimized article with Gemini", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Gemini is rewriting your article. This may take a little while..."):
+                    optimized = rewrite_with_gemini(
+                        data["article"], data["query"], data["missing_terms"], pages
+                    )
+                st.session_state["optimized_article"] = optimized
+                st.success("Your optimized article has been generated.")
+            except Exception as exc:
+                st.error(f"Gemini rewriting failed: {exc}")
 
-    if st.button("Rewrite my complete article with Gemini", type="primary", use_container_width=True):
-        try:
-            with st.spinner("Gemini is rewriting your article. This may take a little while..."):
-                optimized = rewrite_with_gemini(content, keyword, missing_terms, pages)
-            st.session_state["optimized_article"] = optimized
-        except Exception as exc:
-            st.error(f"Gemini rewriting failed: {exc}")
-
-    if st.session_state.get("optimized_article"):
-        st.markdown("### Your optimized article")
-        st.markdown(st.session_state["optimized_article"])
-        st.download_button(
-            "Download optimized article (.md)",
-            st.session_state["optimized_article"],
-            file_name="optimized_article.md",
-            mime="text/markdown",
-        )
-        st.caption("Review all facts, links, prices, dates, and promotional claims before publishing.")
-
-    st.info(
-        "Limitations: some sites block automated access or require JavaScript. "
-        "TF-IDF finds recurring wording, not complete meaning. Search results vary, "
-        "and this tool cannot guarantee rankings. Gemini may also make mistakes, "
-        "so review the rewritten article before publishing."
+if st.session_state.get("optimized_article"):
+    st.subheader("Your optimized article")
+    st.markdown(st.session_state["optimized_article"])
+    st.download_button(
+        "Download optimized article (.md)",
+        st.session_state["optimized_article"],
+        file_name="optimized_article.md",
+        mime="text/markdown",
     )
-
-
-if st.button("Analyze my content", type="primary", use_container_width=True):
-    run_analysis()
+    st.caption("Review all facts, links, prices, dates, and promotional claims before publishing.")
 
 st.divider()
+st.info(
+    "Limitations: some sites block automated access or require JavaScript. "
+    "TF-IDF finds recurring wording, not complete meaning. Search results vary, "
+    "and this tool cannot guarantee rankings. Gemini may also make mistakes, "
+    "so review the rewritten article before publishing."
+)
 st.caption("Python • Streamlit • SerpAPI • Gemini • Trafilatura • scikit-learn")
