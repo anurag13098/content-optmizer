@@ -10,7 +10,11 @@ from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 load_dotenv()
-API_KEY = os.getenv("SERPAPI_KEY", "").strip()
+
+try:
+    API_KEY = st.secrets["SERPAPI_KEY"].strip()
+except Exception:
+    API_KEY = os.getenv("SERPAPI_KEY", "").strip()
 
 st.set_page_config(page_title="Content Optimizer", page_icon="📝", layout="wide")
 st.title("📝 Content Optimizer")
