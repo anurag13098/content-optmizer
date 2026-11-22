@@ -7,7 +7,6 @@ import requests
 import streamlit as st
 import trafilatura
 from dotenv import load_dotenv
-from google import genai
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 load_dotenv()
@@ -124,7 +123,6 @@ def make_gap_report(competitor_texts, article, minimum, limit):
 
 
 def rewrite_with_gemini(article, target_query, missing_terms, competitor_pages):
-    client = genai.Client(api_key=GEMINI_API_KEY)
     keyword_list = ", ".join(missing_terms[:30]) if missing_terms else "No clear missing phrases were detected."
     competitor_context = "\n".join(
         f"- {p['title']}: {p['snippet']}" for p in competitor_pages[:10] if p.get("title")
@@ -153,12 +151,36 @@ REQUIREMENTS:
 6. Do not mention competitor websites or say that you used AI.
 7. Return only the finished article in Markdown. No preface, analysis, checklist, or explanation.
 """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config={"temperature": 0.5},
+
+    # Use Google's current Interactions API and a model available to new API projects.
+    api_url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    response = requests.post(
+        api_url,
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={"model": "gemini-3.8-flash", "input": prompt},
+        timeout=120,
     )
-    result = (response.text or "").strip()
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if not response.ok:
+        error_message = payload.get("error", {}).get("message", response.text[:500])
+        raise RuntimeError(f"Gemini API returned HTTP {response.status_code}: {error_message}")
+
+    # The Interactions API returns model text inside model_output steps.
+    result = (payload.get("output_text") or "").strip()
+    if not result:
+        text_parts = []
+        for step in payload.get("steps", []):
+            if step.get("type") == "model_output":
+                for part in step.get("content", []):
+                    if part.get("type") == "text" and part.get("text"):
+                        text_parts.append(part["text"])
+        result = "\n".join(text_parts).strip()
     if not result:
         raise RuntimeError("Gemini returned an empty response. Please try again.")
     return result
