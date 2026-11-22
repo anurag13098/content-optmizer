@@ -7,32 +7,51 @@ import requests
 import streamlit as st
 import trafilatura
 from dotenv import load_dotenv
+from google import genai
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 load_dotenv()
 
-try:
-    API_KEY = st.secrets["SERPAPI_KEY"].strip()
-except Exception:
-    API_KEY = os.getenv("SERPAPI_KEY", "").strip()
+
+def get_secret(name):
+    try:
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.getenv(name, "").strip()
+
+
+SERPAPI_KEY = get_secret("SERPAPI_KEY")
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 
 st.set_page_config(page_title="Content Optimizer", page_icon="📝", layout="wide")
 st.title("📝 Content Optimizer")
-st.write("Compare your article with pages ranking for your target search query.")
+st.write(
+    "Research pages ranking for your target query, identify content gaps, "
+    "and generate a rewritten draft with newly added phrases highlighted in bold."
+)
 
 with st.sidebar:
-    st.header("Settings")
+    st.header("Research settings")
     result_limit = st.slider("Search results", 3, 10, 10)
     max_terms = st.slider("Suggestions to show", 10, 40, 25)
     min_coverage = st.slider("Minimum competitor page coverage", 1, 10, 2)
+    st.divider()
+    st.caption("AI rewriting uses Gemini. Search research uses SerpAPI.")
 
 keyword = st.text_input("Target search query", placeholder="e.g. amino club coupon code")
-content = st.text_area("Paste your article", height=300, placeholder="Paste your complete article here...")
+content = st.text_area(
+    "Paste your article", height=300,
+    placeholder="Paste your complete article here..."
+)
+
 
 def search_google(query, count):
     response = requests.get(
         "https://serpapi.com/search.json",
-        params={"engine": "google", "q": query, "api_key": API_KEY, "num": count},
+        params={"engine": "google", "q": query, "api_key": SERPAPI_KEY, "num": count},
         timeout=30,
     )
     response.raise_for_status()
@@ -40,6 +59,7 @@ def search_google(query, count):
     if data.get("error"):
         raise RuntimeError(data["error"])
     return data.get("organic_results", [])
+
 
 def extract_page(url):
     try:
@@ -61,6 +81,7 @@ def extract_page(url):
         return None, f"Download failed ({exc.__class__.__name__})."
     except Exception as exc:
         return None, f"Extraction failed ({exc.__class__.__name__})."
+
 
 def make_gap_report(competitor_texts, article, minimum, limit):
     docs = [re.sub(r"\s+", " ", t.lower()).strip() for t in competitor_texts if t]
@@ -101,15 +122,57 @@ def make_gap_report(competitor_texts, article, minimum, limit):
     ).head(limit)
     return report.drop(columns=["_covered", "_coverage"]).reset_index(drop=True), None
 
-def run():
+
+def rewrite_with_gemini(article, target_query, missing_terms, competitor_pages):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    keyword_list = ", ".join(missing_terms[:30]) if missing_terms else "No clear missing phrases were detected."
+    competitor_context = "\n".join(
+        f"- {p['title']}: {p['snippet']}" for p in competitor_pages[:10] if p.get("title")
+    )
+    prompt = f"""
+You are an expert SEO content editor. Rewrite the user's complete article for the target search query.
+
+TARGET SEARCH QUERY:
+{target_query}
+
+POTENTIAL MISSING TOPICS / PHRASES FROM COMPETITOR RESEARCH:
+{keyword_list}
+
+COMPETITOR TITLES AND SEARCH SNIPPETS (research context only; do not copy them):
+{competitor_context}
+
+ORIGINAL ARTICLE:
+{article}
+
+REQUIREMENTS:
+1. Produce a complete, polished, original rewritten article, not an outline or a list of suggestions.
+2. Preserve the original article's factual meaning, named entities, prices, discount codes, dates, links, and claims. Do not invent facts, offers, statistics, testimonials, or product details.
+3. Add relevant missing phrases naturally where they genuinely fit. Do not force irrelevant phrases or keyword-stuff.
+4. Put **Markdown bold** around each newly added target phrase or meaningful new wording. Do not bold text that was already present in the original unless needed for a heading.
+5. Preserve useful headings and improve the structure where appropriate. Use clear H2/H3 headings.
+6. Do not mention competitor websites or say that you used AI.
+7. Return only the finished article in Markdown. No preface, analysis, checklist, or explanation.
+"""
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={"temperature": 0.5},
+    )
+    result = (response.text or "").strip()
+    if not result:
+        raise RuntimeError("Gemini returned an empty response. Please try again.")
+    return result
+
+
+def run_analysis():
     if not keyword.strip():
         st.warning("Enter a target search query.")
         return
     if len(content.split()) < 50:
         st.warning("Please paste at least 50 words of article content.")
         return
-    if not API_KEY:
-        st.error("SerpAPI key missing. Add SERPAPI_KEY=your_key to a .env file.")
+    if not SERPAPI_KEY:
+        st.error("SerpAPI key missing. Add SERPAPI_KEY to Streamlit Secrets.")
         return
 
     try:
@@ -136,13 +199,13 @@ def run():
         for future in as_completed(jobs):
             pos, item = jobs[future]
             try:
-                text, error = future.result()
+                page_text, error = future.result()
             except Exception:
-                text, error = None, "Unexpected extraction error."
+                page_text, error = None, "Unexpected extraction error."
             pages.append({
                 "position": pos, "title": item.get("title", "Untitled"),
                 "url": item.get("link", ""), "snippet": item.get("snippet", ""),
-                "text": text, "error": error,
+                "text": page_text, "error": error,
             })
             finished += 1
             progress.progress(finished / max(len(jobs), 1))
@@ -151,17 +214,17 @@ def run():
     good = [p for p in pages if p["text"]]
     st.metric("Pages with extracted text", f"{len(good)} / {len(results)}")
 
-    for p in pages:
-        with st.expander(f"{p['position']}. {p['title']}"):
-            st.write(p["url"])
-            if p["snippet"]:
-                st.caption(p["snippet"])
-            if p["text"]:
-                st.success(f"Content extracted: {len(p['text'].split()):,} words")
-                st.text_area("Extracted text preview", p["text"][:4000],
-                             height=150, key=f"page_{p['position']}", disabled=True)
+    for page in pages:
+        with st.expander(f"{page['position']}. {page['title']}"):
+            st.write(page["url"])
+            if page["snippet"]:
+                st.caption(page["snippet"])
+            if page["text"]:
+                st.success(f"Content extracted: {len(page['text'].split()):,} words")
+                st.text_area("Extracted text preview", page["text"][:4000],
+                             height=150, key=f"page_{page['position']}", disabled=True)
             else:
-                st.warning(p["error"] or "Could not extract text.")
+                st.warning(page["error"] or "Could not extract text.")
 
     if not good:
         st.error("No page text was extracted. Try another query or retry later.")
@@ -171,26 +234,59 @@ def run():
     report, error = make_gap_report([p["text"] for p in good], content, min_coverage, max_terms)
     if error:
         st.warning(error)
+        missing_terms = []
+    else:
+        gaps = report[report["Your article"] == "Not found"]
+        a, b, c = st.columns(3)
+        a.metric("Pages analyzed", len(good))
+        b.metric("Topics displayed", len(report))
+        c.metric("Potential gaps", len(gaps))
+        st.caption("These phrases are research prompts, not mandatory keywords.")
+        st.dataframe(report, use_container_width=True, hide_index=True)
+        missing_terms = gaps["Topic / phrase"].tolist()
+        if missing_terms:
+            st.write("Topics to review:", ", ".join(missing_terms[:15]))
+        st.download_button(
+            "Download report as CSV", report.to_csv(index=False).encode("utf-8"),
+            "content_gap_report.csv", "text/csv"
+        )
+
+    st.divider()
+    st.subheader("✨ Generate your optimized article")
+    st.write("Gemini will rewrite the complete article and bold newly incorporated relevant phrases.")
+    if not GEMINI_API_KEY:
+        st.warning("Gemini key missing. Add GEMINI_API_KEY to Streamlit Secrets to enable rewriting.")
         return
-    gaps = report[report["Your article"] == "Not found"]
-    a, b, c = st.columns(3)
-    a.metric("Pages analyzed", len(good))
-    b.metric("Topics displayed", len(report))
-    c.metric("Potential gaps", len(gaps))
-    st.caption("These phrases are research prompts, not mandatory keywords.")
-    st.dataframe(report, use_container_width=True, hide_index=True)
-    if not gaps.empty:
-        st.write("Topics to review:", ", ".join(gaps["Topic / phrase"].head(15)))
-    csv = report.to_csv(index=False).encode("utf-8")
-    st.download_button("Download report as CSV", csv, "content_gap_report.csv", "text/csv")
+
+    if st.button("Rewrite my complete article with Gemini", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Gemini is rewriting your article. This may take a little while..."):
+                optimized = rewrite_with_gemini(content, keyword, missing_terms, pages)
+            st.session_state["optimized_article"] = optimized
+        except Exception as exc:
+            st.error(f"Gemini rewriting failed: {exc}")
+
+    if st.session_state.get("optimized_article"):
+        st.markdown("### Your optimized article")
+        st.markdown(st.session_state["optimized_article"])
+        st.download_button(
+            "Download optimized article (.md)",
+            st.session_state["optimized_article"],
+            file_name="optimized_article.md",
+            mime="text/markdown",
+        )
+        st.caption("Review all facts, links, prices, dates, and promotional claims before publishing.")
+
     st.info(
         "Limitations: some sites block automated access or require JavaScript. "
         "TF-IDF finds recurring wording, not complete meaning. Search results vary, "
-        "and this tool cannot guarantee rankings."
+        "and this tool cannot guarantee rankings. Gemini may also make mistakes, "
+        "so review the rewritten article before publishing."
     )
 
+
 if st.button("Analyze my content", type="primary", use_container_width=True):
-    run()
+    run_analysis()
 
 st.divider()
-st.caption("Python • Streamlit • SerpAPI • Trafilatura • scikit-learn")
+st.caption("Python • Streamlit • SerpAPI • Gemini • Trafilatura • scikit-learn")
